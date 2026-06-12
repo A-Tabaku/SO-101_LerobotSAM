@@ -31,9 +31,77 @@ class SelectionResult:
 
 
 def grounding_frame(image: np.ndarray, mask: np.ndarray, dim_factor: float = 0.35) -> np.ndarray:
+    """DEBUG render: dim the whole scene, keep the target at full brightness.
+
+    Destroys background information, so it is for debugging/visualization only —
+    training inputs should use ``grounding_overlay_frame`` (light visual prompt
+    on a normal-brightness image).
+    """
     out = (image.astype(np.float32) * dim_factor).clip(0, 255).astype(np.uint8)
     out[mask.astype(bool)] = image[mask.astype(bool)]
     return out
+
+
+def grounding_overlay_frame(
+    image: np.ndarray,
+    mask: np.ndarray | None,
+    *,
+    color: tuple[int, int, int] = (0, 60, 190),
+    alpha: float = 0.35,
+    draw_contour: bool = True,
+    contour_width: int = 2,
+    bbox_xyxy: list[int] | None = None,
+    bbox_width: int = 2,
+    draw_crosshair: bool = False,
+    crosshair_size: int = 16,
+) -> np.ndarray:
+    """TRAINING render: keep the RGB at full brightness and add a *light* visual
+    prompt — a semi-transparent ``color`` tint over the target ``mask``, its
+    contour, and/or a bounding box + crosshair.
+
+    A tight mask is the marker for a *grasp* target (precise object silhouette,
+    doesn't occlude neighbours). A bbox + crosshair is the marker for a *place*
+    target (a region + drop point) — it outlines a large area like the tray
+    without a fill that would hide the bin interior. ``color`` is the image's
+    channel order (RGB here). Returns a new uint8 array.
+    """
+    out = np.ascontiguousarray(image.astype(np.uint8))
+    color_arr = np.asarray(color, dtype=np.float32)
+    if mask is not None:
+        m = mask.astype(bool)
+        if m.any():
+            out[m] = (out[m].astype(np.float32) * (1.0 - alpha) + color_arr * alpha).clip(0, 255).astype(np.uint8)
+            if draw_contour:
+                _draw_mask_contour(out, m, color, contour_width)
+    if bbox_xyxy is not None:
+        _draw_bbox(out, bbox_xyxy, color, bbox_width)
+        if draw_crosshair:
+            _draw_crosshair(out, bbox_xyxy, color, crosshair_size, bbox_width)
+    return out
+
+
+def _draw_mask_contour(image: np.ndarray, mask: np.ndarray, color: tuple[int, int, int], width: int) -> None:
+    import cv2
+
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(image, contours, -1, tuple(int(c) for c in color), int(width))
+
+
+def _draw_bbox(image: np.ndarray, bbox_xyxy: list[int], color: tuple[int, int, int], width: int) -> None:
+    import cv2
+
+    x1, y1, x2, y2 = (int(v) for v in bbox_xyxy)
+    cv2.rectangle(image, (x1, y1), (x2, y2), tuple(int(c) for c in color), int(width))
+
+
+def _draw_crosshair(image: np.ndarray, bbox_xyxy: list[int], color: tuple[int, int, int], size: int, width: int) -> None:
+    import cv2
+
+    x1, y1, x2, y2 = (int(v) for v in bbox_xyxy)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    rgb = tuple(int(c) for c in color)
+    cv2.line(image, (cx - size, cy), (cx + size, cy), rgb, int(width))
+    cv2.line(image, (cx, cy - size), (cx, cy + size), rgb, int(width))
 
 
 def ellipse_mask_from_box(image_shape: tuple[int, int, int] | tuple[int, int], bbox_xyxy: list[int]) -> np.ndarray:

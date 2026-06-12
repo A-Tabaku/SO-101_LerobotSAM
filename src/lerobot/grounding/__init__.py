@@ -12,6 +12,7 @@ from .pipeline import (
     GROUNDING_SUCCESS_KEY,
     bbox_from_center,
     grounding_frame,
+    grounding_overlay_frame,
     select_box_for_episode,
     terminal_binary_label,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "GROUNDING_SUCCESS_KEY",
     "bbox_from_center",
     "grounding_frame",
+    "grounding_overlay_frame",
     "select_box_for_episode",
     "terminal_binary_label",
 ]
