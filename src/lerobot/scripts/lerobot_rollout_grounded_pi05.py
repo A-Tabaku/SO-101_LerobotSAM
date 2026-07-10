@@ -37,11 +37,20 @@ Run in the ``so101-sam`` conda env (has sam3 + lerobot + pi05).
 
 import json
 import logging
+import select
+import sys
 import time
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:  # POSIX-only: single-keypress early-stop during live episodes
+    import termios
+    import tty
+    _HAS_TTY = True
+except ImportError:  # pragma: no cover - non-POSIX
+    _HAS_TTY = False
 
 import draccus
 import numpy as np
@@ -61,6 +70,47 @@ logger = logging.getLogger("grounded_rollout")
 # and surface the SAM segmenter's messages ("Loading SAM3…", "Locked target…") too.
 logger.setLevel(logging.INFO)
 logging.getLogger("lerobot.grounding").setLevel(logging.INFO)
+
+
+def _early_stop_enter(active: bool):
+    """Put stdin in cbreak mode so one keypress can end the current episode early.
+    Returns saved terminal state, or None when disabled / stdin isn't a TTY (e.g.
+    piped input or a backgrounded run) — early-stop is simply off in that case."""
+    if not active or not _HAS_TTY:
+        return None
+    try:
+        if not sys.stdin.isatty():
+            return None
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return (fd, old)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _early_stop_pressed(state):
+    """Return the pressed key (consuming it) if the operator hit one, else None."""
+    if state is None:
+        return None
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        if ready:
+            return sys.stdin.read(1)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _early_stop_restore(state) -> None:
+    """Restore the terminal mode saved by _early_stop_enter (safe to call twice)."""
+    if state is None:
+        return
+    fd, old = state
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:  # noqa: BLE001
+        pass
 
 DEFAULT_OUTPUT = "/home/summer2026/projects/lerobotprocessing/debug_grounded_rollout"
 
@@ -109,6 +159,18 @@ class GroundedRolloutConfig:
     revert_chunks: int = 2
     revert_max_dist_frac: float = 0.07  # only the target's exact spot counts (not neighbour berries)
     revert_grace_chunks: int = 2  # after switching to placement, wait this many chunks before a revert can fire (let a real grasp carry the berry away)
+    # Phase-switch MODE — accuracy tuning for the grasp->placement transition:
+    #   "gripper" (legacy) — switch when the gripper holds closed OR mask-loss-while-closed. Fires easily;
+    #             a WEAK grasp (gripper closes but berry not actually held) falsely switches to placement,
+    #             then the arm wanders to a NEW berry. Relies on revert to recover.
+    #   "lift"    — switch ONLY when the berry has left the frame (mask lost = lifted/occluded) AND the
+    #             gripper is held closed. A weak grasp that leaves the berry visible does NOT switch, so the
+    #             mask stays on and the policy retries the SAME berry. More robust; use for BOX.
+    #   "never"   — never switch; keep the target mask on for the whole episode. Best for BERRY (placement
+    #             is raw anyway): a dropped berry keeps its mask so the policy re-attempts the same berry
+    #             instead of drifting. (Box can't use "never" — it needs the switch to draw the tray box.)
+    #             NOTE: do NOT name this "off" — draccus parses "off" as a YAML boolean -> the string "False".
+    phase_switch: str = "gripper"
 
     # ── Control loop ──────────────────────────────────────────────────────────
     fps: float | None = None  # None -> read from dataset meta (20)
@@ -427,6 +489,12 @@ def run_live(cfg: GroundedRolloutConfig) -> None:
             cfg.sam_prompt, confidence_threshold=cfg.sam_confidence, device=device,
             redetect_max_dist_frac=cfg.redetect_max_dist_frac,
         )
+        if cfg.phase_switch in ("never", "off", "False"):
+            logger.info("PHASE SWITCH = NEVER — mask stays on the target ALL episode; NEVER enters placement "
+                        "mode (a failed/pushing grasp keeps trying the same berry).")
+        else:
+            logger.info("PHASE SWITCH = %r (placement=%s). Grasp->placement can trigger.",
+                        cfg.phase_switch, cfg.placement_style)
     else:
         logger.info("grounding=False: RAW mode (no SAM/overlay/lock-on).")
 
@@ -446,6 +514,7 @@ def run_live(cfg: GroundedRolloutConfig) -> None:
     tag = f"_{cfg.run_tag}" if cfg.run_tag else ""
     log_path = out / f"harvest_log{tag}.jsonl"
     summary_rows = []
+    estop_state = None
     try:
         for ep in range(cfg.episodes):
             # Reset gate: let the operator reposition the arm + re-place the berries/scene
@@ -504,7 +573,15 @@ def run_live(cfg: GroundedRolloutConfig) -> None:
             ep_start = time.perf_counter()
             loop_times = []
 
+            estop_state = _early_stop_enter(active=not cfg.dry_run)
+            if estop_state is not None:
+                logger.info("Press any key to END this episode early (auto-ends at %.0fs).", cfg.episode_duration_s)
+
             while time.perf_counter() - ep_start < cfg.episode_duration_s:
+                estop_key = _early_stop_pressed(estop_state)
+                if estop_key is not None:
+                    logger.info("Episode %d ended early by operator (key=%r).", ep + 1, estop_key)
+                    break
                 loop_start = time.perf_counter()
                 need_infer = len(policy._action_queue) == 0
                 obs = robot.get_observation()
@@ -537,10 +614,18 @@ def run_live(cfg: GroundedRolloutConfig) -> None:
                         # Switch on the GRIPPER closing (held for grasp_hold_chunks) — the reliable grasp
                         # signal — OR mask-loss-while-closed. SAM usually keeps seeing the carried berry,
                         # so mask-loss alone rarely fires. The revert undoes false switches (berry still on table).
-                        if cfg.grasp_gripper_close_thresh is None:
-                            grasped = mask_lost  # gripper signal disabled -> mask-loss only
-                        else:
-                            grasped = gripper_closed_streak >= cfg.grasp_hold_chunks or (mask_lost and bool(gripper_closed))
+                        gripper_held = (cfg.grasp_gripper_close_thresh is None) or (gripper_closed_streak >= cfg.grasp_hold_chunks)
+                        if cfg.phase_switch in ("never", "off", "False"):
+                            grasped = False  # never switch: keep the mask on the target the whole episode
+                        elif cfg.phase_switch == "lift":
+                            # require the berry to have LEFT the frame (lifted/occluded) AND a held grasp;
+                            # a weak grasp that leaves the berry visible on the table won't falsely switch.
+                            grasped = mask_lost and gripper_held
+                        else:  # "gripper" (legacy)
+                            if cfg.grasp_gripper_close_thresh is None:
+                                grasped = mask_lost
+                            else:
+                                grasped = gripper_closed_streak >= cfg.grasp_hold_chunks or (mask_lost and bool(gripper_closed))
                         if grasped:
                             phase = "placement"
                             phase_switch_chunk = n_chunks
@@ -632,6 +717,8 @@ def run_live(cfg: GroundedRolloutConfig) -> None:
                 if sleep_t > 0:
                     time.sleep(sleep_t)
 
+            _early_stop_restore(estop_state)
+            estop_state = None
             achieved_hz = (tick / (time.perf_counter() - ep_start)) if tick else 0.0
             logger.info("Episode %d done: %d ticks, %d chunks, ~%.1f Hz.", ep + 1, tick, n_chunks, achieved_hz)
 
@@ -661,6 +748,7 @@ def run_live(cfg: GroundedRolloutConfig) -> None:
                 f.write(json.dumps(row) + "\n")
             logger.info("Logged: %s", row)
     finally:
+        _early_stop_restore(estop_state)
         try:
             robot.disconnect()
         except Exception:
